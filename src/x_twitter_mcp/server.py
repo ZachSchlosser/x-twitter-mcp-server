@@ -90,6 +90,28 @@ def check_rate_limit(action_type: str) -> bool:
     return True
 
 
+def _get_bookmarks_with_user_auth(client: tweepy.Client, max_results: int = 100, pagination_token: Optional[str] = None):
+    """Fetch bookmarks using OAuth 1.0a user context.
+
+    tweepy.Client.get_bookmarks() does not expose a user_auth parameter and
+    always defaults to bearer token auth, which the bookmarks endpoint rejects
+    with 403. This helper calls _make_request() directly with user_auth=True.
+    """
+    user_id = client._get_authenticating_user_id(oauth_1=True)
+    params = {"max_results": max_results, "tweet.fields": "id,text,created_at,author_id"}
+    if pagination_token:
+        params["pagination_token"] = pagination_token
+    return client._make_request(
+        "GET", f"/2/users/{user_id}/bookmarks",
+        params=params,
+        endpoint_parameters=("expansions", "max_results", "media.fields",
+                             "pagination_token", "place.fields", "poll.fields",
+                             "tweet.fields", "user.fields"),
+        data_type=tweepy.Tweet,
+        user_auth=True
+    )
+
+
 # User Management Tools
 @server.tool(name="get_user_profile", description="Get detailed profile information for a user")
 async def get_user_profile(user_id: str) -> Dict:
@@ -336,7 +358,7 @@ async def delete_all_bookmarks() -> Dict:
         raise Exception("Tweet action rate limit exceeded")
     client, _ = initialize_twitter_clients()
     # Twitter API v2 doesn't have a direct endpoint; simulate by fetching and removing
-    bookmarks = client.get_bookmarks(user_auth=True)
+    bookmarks = _get_bookmarks_with_user_auth(client)
     for bookmark in (bookmarks.data or []):
         client.remove_bookmark(tweet_id=bookmark.id)
     return {"status": "all bookmarks deleted"}
@@ -361,12 +383,7 @@ async def get_bookmarks(count: Optional[int] = 100, cursor: Optional[str] = None
         effective_count = 100
     else:
         effective_count = count
-    bookmarks = client.get_bookmarks(
-        max_results=effective_count,
-        pagination_token=cursor,
-        tweet_fields=["id", "text", "created_at", "author_id"],
-        user_auth=True
-    )
+    bookmarks = _get_bookmarks_with_user_auth(client, max_results=effective_count, pagination_token=cursor)
     return [tweet.data for tweet in (bookmarks.data or [])]
 
 # Timeline & Search Tools
