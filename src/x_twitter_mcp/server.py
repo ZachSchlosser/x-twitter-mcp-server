@@ -1,6 +1,7 @@
 import logging
 import os
 import warnings
+import requests
 from fastmcp import FastMCP
 import tweepy
 from collections import defaultdict
@@ -64,25 +65,40 @@ def initialize_twitter_clients() -> tuple[tweepy.Client, tweepy.API]:
     return _twitter_client, _twitter_v1_api
 
 
-def _make_oauth2_bookmarks_client() -> tweepy.Client:
-    """Return a Tweepy client using the OAuth 2.0 user access token.
+def _bookmarks_api(method: str, tweet_id: Optional[str] = None, params: Optional[dict] = None) -> dict:
+    """Make a bookmark API request using OAuth 2.0 User Context.
 
     The bookmarks endpoint (/2/users/:id/bookmarks) requires OAuth 2.0 User
-    Context. It rejects both app-only bearer tokens and OAuth 1.0a. A user
-    OAuth 2.0 token — obtained via the PKCE authorization flow — is passed as
-    the bearer token, which satisfies the requirement.
+    Context — it rejects both app-only bearer tokens and OAuth 1.0a. This
+    function resolves the authenticated user ID via /2/users/me, then calls
+    the bookmarks endpoint with the user-scoped token as a Bearer.
 
-    Set TWITTER_OAUTH2_USER_ACCESS_TOKEN to the token produced by the PKCE
-    flow (tweepy.OAuth2UserHandler).
+    Set TWITTER_OAUTH2_USER_ACCESS_TOKEN to the token obtained via the PKCE
+    authorization flow (tweepy.OAuth2UserHandler) with bookmark.read,
+    bookmark.write, and users.read scopes.
+
+    Args:
+        method: HTTP method ("GET" or "DELETE").
+        tweet_id: Tweet ID appended to the URL for DELETE requests.
+        params: Query parameters for GET requests.
     """
     token = os.getenv("TWITTER_OAUTH2_USER_ACCESS_TOKEN")
     if not token:
         raise EnvironmentError(
             "Missing required environment variable: TWITTER_OAUTH2_USER_ACCESS_TOKEN. "
-            "Obtain one via the PKCE flow (tweepy.OAuth2UserHandler) with "
-            "bookmark.read and users.read scopes."
+            "Obtain one via the PKCE authorization flow (tweepy.OAuth2UserHandler) "
+            "with bookmark.read, bookmark.write, and users.read scopes."
         )
-    return tweepy.Client(bearer_token=token)
+    headers = {"Authorization": f"Bearer {token}"}
+    me = requests.get("https://api.twitter.com/2/users/me", headers=headers)
+    me.raise_for_status()
+    user_id = me.json()["data"]["id"]
+    url = f"https://api.twitter.com/2/users/{user_id}/bookmarks"
+    if tweet_id:
+        url += f"/{tweet_id}"
+    resp = requests.request(method, url, headers=headers, params=params or {})
+    resp.raise_for_status()
+    return resp.json()
 
 
 # Rate limiting configuration
@@ -356,18 +372,11 @@ async def delete_all_bookmarks() -> Dict:
     """Deletes all bookmarks. (Simulated as Twitter API v2 doesn't have a direct endpoint for this. Fetches all bookmarks and deletes them one by one.)"""
     if not check_rate_limit("tweet_actions"):
         raise Exception("Tweet action rate limit exceeded")
-    client, _ = initialize_twitter_clients()
-    # Twitter API v2 doesn't have a direct endpoint; simulate by fetching and removing
-    oauth2_client = _make_oauth2_bookmarks_client()
-    user_id = oauth2_client._get_authenticating_user_id()
-    bookmarks = oauth2_client._make_request(
-        "GET", f"/2/users/{user_id}/bookmarks",
-        params={"max_results": 100},
-        endpoint_parameters=("max_results",),
-        data_type=tweepy.Tweet,
-    )
-    for bookmark in (bookmarks.data or []):
-        client.remove_bookmark(tweet_id=bookmark.id)
+    # Twitter API v2 doesn't have a direct endpoint; simulate by fetching and removing.
+    # Both fetch and delete require OAuth 2.0 User Context.
+    data = _bookmarks_api("GET", params={"max_results": 100})
+    for tweet in data.get("data", []):
+        _bookmarks_api("DELETE", tweet_id=tweet["id"])
     return {"status": "all bookmarks deleted"}
 
 @server.tool(name="get_bookmarks", description="Retrieves the authenticated user's bookmarked tweets. Requires Basic access tier or higher.")
@@ -375,7 +384,7 @@ async def get_bookmarks(count: Optional[int] = 100, cursor: Optional[str] = None
     """Fetches the authenticated user's bookmarked tweets.
 
     Requires TWITTER_OAUTH2_USER_ACCESS_TOKEN — a user-scoped OAuth 2.0 token
-    obtained via the PKCE flow with bookmark.read and users.read scopes.
+    obtained via the PKCE authorization flow with bookmark.read and users.read scopes.
 
     Args:
         count (Optional[int]): Number of bookmarks to retrieve. Default 100. Min 1, Max 100.
@@ -391,21 +400,14 @@ async def get_bookmarks(count: Optional[int] = 100, cursor: Optional[str] = None
         effective_count = 100
     else:
         effective_count = count
-    oauth2_client = _make_oauth2_bookmarks_client()
-    user_id = oauth2_client._get_authenticating_user_id()
-    bookmarks = oauth2_client._make_request(
-        "GET", f"/2/users/{user_id}/bookmarks",
-        params={
-            "max_results": effective_count,
-            "pagination_token": cursor,
-            "tweet.fields": "id,text,created_at,author_id",
-        },
-        endpoint_parameters=("expansions", "max_results", "media.fields",
-                             "pagination_token", "place.fields", "poll.fields",
-                             "tweet.fields", "user.fields"),
-        data_type=tweepy.Tweet,
-    )
-    return [tweet.data for tweet in (bookmarks.data or [])]
+    params: dict = {
+        "max_results": effective_count,
+        "tweet.fields": "id,text,created_at,author_id",
+    }
+    if cursor:
+        params["pagination_token"] = cursor
+    data = _bookmarks_api("GET", params=params)
+    return data.get("data", [])
 
 # Timeline & Search Tools
 @server.tool(name="get_timeline", description="Get tweets from your home timeline (For You)")
