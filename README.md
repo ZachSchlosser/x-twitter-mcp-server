@@ -79,6 +79,40 @@ If you prefer to install from the source repository:
       TWITTER_ACCESS_TOKEN_SECRET=your_access_token_secret
       TWITTER_BEARER_TOKEN=your_bearer_token
       ```
+    - To use bookmark tools (`get_bookmarks`, `delete_all_bookmarks`), also add an OAuth 2.0 user access token:
+      ```
+      TWITTER_OAUTH2_USER_ACCESS_TOKEN=your_oauth2_user_token
+      ```
+      See [Obtaining an OAuth 2.0 User Token](#obtaining-an-oauth-20-user-token) below.
+
+## Obtaining an OAuth 2.0 User Token
+
+The bookmark endpoints (`GET /2/users/:id/bookmarks`, `DELETE /2/users/:id/bookmarks/:tweet_id`) require **OAuth 2.0 User Context** — they reject both app-only bearer tokens and OAuth 1.0a. You need to perform the PKCE authorization flow once to obtain a user-scoped token.
+
+### Steps
+
+1. In the [Twitter Developer Portal](https://developer.twitter.com/), open your app → **Settings** → **User authentication settings** and enable OAuth 2.0. Set a callback URL (e.g. `https://localhost/`).
+
+2. Run the PKCE flow using Tweepy:
+
+```python
+import tweepy
+
+handler = tweepy.OAuth2UserHandler(
+    client_id="YOUR_CLIENT_ID",       # OAuth 2.0 Client ID (from Developer Portal)
+    redirect_uri="https://localhost/",
+    scope=["bookmark.read", "bookmark.write", "users.read", "offline.access"],
+    client_secret="YOUR_CLIENT_SECRET",  # Optional for public clients
+)
+
+print(handler.get_authorization_url())
+# Open the URL, authorize, copy the redirected URL, then:
+redirected_url = input("Paste redirected URL: ")
+token = handler.fetch_token(redirected_url)
+print(token["access_token"])
+```
+
+3. Set the resulting token as `TWITTER_OAUTH2_USER_ACCESS_TOKEN` in your environment or `.env` file.
 
 ## Running the Server
 
@@ -182,7 +216,8 @@ If installed from PyPI:
         "TWITTER_API_SECRET": "your_api_secret",
         "TWITTER_ACCESS_TOKEN": "your_access_token",
         "TWITTER_ACCESS_TOKEN_SECRET": "your_access_token_secret",
-        "TWITTER_BEARER_TOKEN": "your_bearer_token"
+        "TWITTER_BEARER_TOKEN": "your_bearer_token",
+        "TWITTER_OAUTH2_USER_ACCESS_TOKEN": "your_oauth2_user_token"
       }
     }
   }
@@ -388,7 +423,7 @@ Below is a list of all tools provided by the `x-twitter-mcp` server, along with 
   Claude will remove the bookmark and confirm the action.
 
 #### `delete_all_bookmarks`
-- **Description**: Deletes all bookmarks.
+- **Description**: Deletes all bookmarks (simulated by fetching and removing one by one). Requires `TWITTER_OAUTH2_USER_ACCESS_TOKEN`.
 - **Claude Desktop Example**:
   ```
   Delete all my Twitter bookmarks.
@@ -396,7 +431,7 @@ Below is a list of all tools provided by the `x-twitter-mcp` server, along with 
   Claude will delete all bookmarks and confirm the action.
 
 #### `get_bookmarks`
-- **Description**: Retrieves the authenticated user's bookmarked tweets. Requires Basic access tier or higher.
+- **Description**: Retrieves the authenticated user's bookmarked tweets (up to 800 most recent). Requires `TWITTER_OAUTH2_USER_ACCESS_TOKEN`.
 - **Claude Desktop Example**:
   ```
   Show my Twitter bookmarks, limit to 25.
@@ -469,6 +504,10 @@ Below is a list of all tools provided by the `x-twitter-mcp` server, along with 
 
 - **Rate Limit Errors**:
     - The server includes rate limit handling, but if you hit Twitter API limits, you may need to wait for the reset window (e.g., 15 minutes for tweet actions).
+
+- **Bookmark tools return 403**:
+    - `get_bookmarks` and `delete_all_bookmarks` require `TWITTER_OAUTH2_USER_ACCESS_TOKEN`. App-only bearer tokens and OAuth 1.0a are rejected by the bookmarks endpoint.
+    - See [Obtaining an OAuth 2.0 User Token](#obtaining-an-oauth-20-user-token) for setup instructions.
 
 - **Syntax Warnings**:
     - If you see `SyntaxWarning` messages from Tweepy, they are due to docstring issues in Tweepy with Python 3.13. The server includes a warning suppression to handle this.
