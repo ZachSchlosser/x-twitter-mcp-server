@@ -1,6 +1,7 @@
 import logging
 import os
 import warnings
+import requests
 from fastmcp import FastMCP
 import tweepy
 from collections import defaultdict
@@ -62,6 +63,56 @@ def initialize_twitter_clients() -> tuple[tweepy.Client, tweepy.API]:
     _twitter_v1_api = tweepy.API(auth)
 
     return _twitter_client, _twitter_v1_api
+
+_API_TIMEOUT = 30  # seconds
+
+
+def _get_oauth2_headers_and_user_id() -> tuple[dict, str]:
+    """Resolve OAuth 2.0 Authorization headers and the authenticated user ID.
+
+    The bookmarks endpoint (/2/users/:id/bookmarks) requires OAuth 2.0 User
+    Context — it rejects both app-only bearer tokens and OAuth 1.0a.
+
+    Set TWITTER_OAUTH2_USER_ACCESS_TOKEN to the token obtained via the PKCE
+    authorization flow (tweepy.OAuth2UserHandler) with bookmark.read,
+    bookmark.write, and users.read scopes.
+
+    Returns:
+        A (headers, user_id) tuple. Call once per operation and reuse across
+        multiple requests to avoid redundant /2/users/me lookups.
+    """
+    token = os.getenv("TWITTER_OAUTH2_USER_ACCESS_TOKEN")
+    if not token:
+        raise EnvironmentError(
+            "Missing required environment variable: TWITTER_OAUTH2_USER_ACCESS_TOKEN. "
+            "Obtain one via the PKCE authorization flow (tweepy.OAuth2UserHandler) "
+            "with bookmark.read, bookmark.write, and users.read scopes."
+        )
+    headers = {"Authorization": f"Bearer {token}"}
+    me = requests.get("https://api.twitter.com/2/users/me", headers=headers, timeout=_API_TIMEOUT)
+    me.raise_for_status()
+    return headers, me.json()["data"]["id"]
+
+
+def _bookmarks_request(method: str, headers: dict, user_id: str,
+                       tweet_id: Optional[str] = None,
+                       params: Optional[dict] = None) -> dict:
+    """Make a single bookmark API request.
+
+    Args:
+        method: HTTP method ("GET" or "DELETE").
+        headers: Authorization headers from _get_oauth2_headers_and_user_id().
+        user_id: Authenticated user's ID.
+        tweet_id: Tweet ID appended to the URL for DELETE requests.
+        params: Query parameters for GET requests.
+    """
+    url = f"https://api.twitter.com/2/users/{user_id}/bookmarks"
+    if tweet_id:
+        url += f"/{tweet_id}"
+    resp = requests.request(method, url, headers=headers, params=params or {}, timeout=_API_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
 
 # Rate limiting configuration
 RATE_LIMITS = {
@@ -329,17 +380,77 @@ async def delete_bookmark(tweet_id: str) -> Dict:
     result = client.remove_bookmark(tweet_id=tweet_id)
     return {"tweet_id": tweet_id, "bookmarked": not result.data["bookmarked"]}
 
-@server.tool(name="delete_all_bookmarks", description="Deletes all bookmarks (simulated)")
+@server.tool(name="delete_all_bookmarks", description="DESTRUCTIVE AND IRREVERSIBLE: Permanently deletes ALL bookmarks one by one. This cannot be undone. Always confirm explicitly with the user before calling this tool.")
 async def delete_all_bookmarks() -> Dict:
-    """Deletes all bookmarks. (Simulated as Twitter API v2 doesn't have a direct endpoint for this. Fetches all bookmarks and deletes them one by one.)"""
+    """Permanently deletes all of the authenticated user's bookmarks. IRREVERSIBLE.
+
+    WARNING: This action cannot be undone. Every bookmark will be permanently
+    removed. You MUST obtain explicit confirmation from the user before calling
+    this tool. Do not call this based on an ambiguous or casual request.
+
+    Simulated: Twitter API v2 has no bulk-delete endpoint, so bookmarks are
+    fetched page-by-page and deleted one by one.
+    """
     if not check_rate_limit("tweet_actions"):
         raise Exception("Tweet action rate limit exceeded")
-    client, _ = initialize_twitter_clients()
-    # Twitter API v2 doesn't have a direct endpoint; simulate by fetching and removing
-    bookmarks = client.get_bookmarks()
-    for bookmark in bookmarks.data:
-        client.remove_bookmark(tweet_id=bookmark["id"])
-    return {"status": "all bookmarks deleted"}
+    # Twitter API v2 doesn't have a bulk-delete endpoint; fetch all pages and
+    # remove bookmarks one by one. Both fetch and delete require OAuth 2.0.
+    headers, user_id = _get_oauth2_headers_and_user_id()
+    deleted = 0
+    next_token = None
+    while True:
+        params: dict = {"max_results": 100}
+        if next_token:
+            params["pagination_token"] = next_token
+        data = _bookmarks_request("GET", headers, user_id, params=params)
+        tweets = data.get("data", [])
+        if not tweets:
+            break
+        for tweet in tweets:
+            if not check_rate_limit("tweet_actions"):
+                raise Exception(
+                    f"Tweet action rate limit exceeded after deleting {deleted} bookmarks"
+                )
+            _bookmarks_request("DELETE", headers, user_id, tweet_id=tweet["id"])
+            deleted += 1
+        next_token = data.get("meta", {}).get("next_token")
+        if not next_token:
+            break
+    return {"status": "all bookmarks deleted", "deleted_count": deleted}
+
+@server.tool(name="get_bookmarks", description="Retrieves the authenticated user's bookmarked tweets. Requires Basic access tier or higher.")
+async def get_bookmarks(count: Optional[int] = 100, cursor: Optional[str] = None) -> List[Dict]:
+    """Fetches the authenticated user's bookmarked tweets.
+
+    Requires TWITTER_OAUTH2_USER_ACCESS_TOKEN — a user-scoped OAuth 2.0 token
+    obtained via the PKCE authorization flow with bookmark.read and users.read
+    scopes.
+
+    Args:
+        count (Optional[int]): Number of bookmarks to retrieve per page.
+            Default 100. Min 1, Max 100.
+        cursor (Optional[str]): Pagination token for fetching the next page of
+            results (pass the next_token from a previous response's meta).
+    """
+    if not check_rate_limit("tweet_actions"):
+        raise Exception("Tweet action rate limit exceeded")
+    if count is None:
+        effective_count = 100
+    elif count < 1:
+        effective_count = 1
+    elif count > 100:
+        effective_count = 100
+    else:
+        effective_count = count
+    headers, user_id = _get_oauth2_headers_and_user_id()
+    params: dict = {
+        "max_results": effective_count,
+        "tweet.fields": "id,text,created_at,author_id",
+    }
+    if cursor:
+        params["pagination_token"] = cursor
+    data = _bookmarks_request("GET", headers, user_id, params=params)
+    return data.get("data", [])
 
 # Timeline & Search Tools
 @server.tool(name="get_timeline", description="Get tweets from your home timeline (For You)")
