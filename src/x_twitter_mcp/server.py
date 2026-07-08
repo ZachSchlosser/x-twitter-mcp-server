@@ -187,7 +187,7 @@ async def get_user_followers(user_id: str, count: Optional[int] = 100, cursor: O
     if not check_rate_limit("follow_actions"):
         raise Exception("Follow action rate limit exceeded")
     client, _ = initialize_twitter_clients()
-    followers = client.get_users_followers(id=user_id, max_results=count, pagination_token=cursor, user_fields=["id", "name", "username"])
+    followers = client.get_users_followers(id=user_id, max_results=count, pagination_token=cursor, user_fields=["id", "name", "username", "description", "url", "location", "profile_image_url", "verified_type", "public_metrics", "created_at"])
     return [user.data for user in (followers.data or [])]
 
 @server.tool(name="get_user_following", description="Retrieves users the given user is following")
